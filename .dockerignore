@@ -1,0 +1,22 @@
+# Ignore model weights and large files
+models/
+*.bin
+*.safetensors
+*.pt
+*.ckpt
+*.onnx
+*.tflite
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
+./.git/
+*.pack
+*.idx
+*.lfs
+.venv/
+venv/
+.env
+*.env
+.cache/
+.DS_Store
