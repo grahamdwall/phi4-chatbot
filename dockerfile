@@ -41,8 +41,8 @@ RUN accelerate config default
 COPY train_phi2_lora.py .
 COPY evaluate_phi2.py .
 COPY train_server.py .
-RUN mkdir -p /workspace/data/test
-COPY mortgage_finetune_1000.jsonl /workspace/data/test/
+RUN mkdir -p ./data/test
+COPY mortgage_finetune_1000.jsonl ./data/test/
 
 # Copy your baked-in LLM models
 #COPY phi2_model_full/ ./models/microsoft/phi-2

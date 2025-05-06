@@ -7,6 +7,6 @@ accelerate==0.29.2
 pydantic>=2.0,<3.0
 datasets
 peft==0.10.0
-bitsandbytes
 dotenv
 argparse
+python-multipart>=0.0.5
