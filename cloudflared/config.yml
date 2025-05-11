@@ -1,0 +1,6 @@
+tunnel: 781f2a4e-95e4-40ab-a3f7-fc673540c712
+credentials-file: /root/.cloudflared/781f2a4e-95e4-40ab-a3f7-fc673540c712.json
+url: http://localhost:8080
+no-autoupdate: true
+metrics: 0.0.0.0:2000
+loglevel: info

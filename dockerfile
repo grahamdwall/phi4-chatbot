@@ -16,6 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
     gcc \
+    wget \
+    sudo \
     libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
@@ -34,6 +36,11 @@ RUN pip install --no-cache-dir torch==2.1.2+cu121 --index-url https://download.p
 # Then install the rest of the requirements from your requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Add cloudflared
+RUN wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb && \
+    dpkg -i cloudflared-linux-amd64.deb && \
+    rm cloudflared-linux-amd64.deb
+
 # Install accelerate CLI (optional: configure later)
 RUN accelerate config default
 
@@ -41,16 +48,28 @@ RUN accelerate config default
 COPY train_phi2_lora.py .
 COPY evaluate_phi2.py .
 COPY train_server.py .
+COPY start.sh .
 RUN mkdir -p ./data/test
 COPY mortgage_finetune_1000.jsonl ./data/test/
+
+# --- Copy Cloudflare credentials (during docker build or mount at runtime) ---
+# Make sure you COPY cert.pem and tunnel credentials json into image or volume
+COPY cloudflared /root/.cloudflared
+
+# --- Set up sysctl for large socket buffers ---
+RUN sysctl -w net.core.rmem_max=2500000 || true
 
 # Copy your baked-in LLM models
 #COPY phi2_model_full/ ./models/microsoft/phi-2
 
 EXPOSE 8000
 
+# --- Start script ---
+RUN chmod +x start.sh
+CMD ["bash", "start.sh"]
+
 # for testing
 #CMD ["uvicorn", "phi2_api:app", "--host", "0.0.0.0", "--port", "8000", "--log-level", "debug"]
 # for production
 #CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "phi2_finetune:app", "--bind", "0.0.0.0:8080"]
-CMD ["gunicorn", "-w", "1", "-k", "uvicorn.workers.UvicornWorker", "train_server:app", "--bind", "0.0.0.0:8080"]
+#CMD ["gunicorn", "-w", "1", "-k", "uvicorn.workers.UvicornWorker", "train_server:app", "--bind", "0.0.0.0:8080"]

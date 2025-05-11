@@ -10,3 +10,5 @@ peft==0.10.0
 dotenv
 argparse
 python-multipart>=0.0.5
+safetensors
+sentencepiece

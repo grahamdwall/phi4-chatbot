@@ -1,52 +1,125 @@
 import os
+import sys
 import time
 import json
 import torch
 import subprocess
 import threading
-from fastapi import FastAPI, File, UploadFile, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, BackgroundTasks, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 from fastapi.responses import JSONResponse
-from huggingface_hub import HfApi, HfFolder
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from huggingface_hub import HfApi, HfFolder, snapshot_download
+from transformers import AutoTokenizer, AutoModelForCausalLM, TextGenerationPipeline
 from dotenv import load_dotenv
 import glob
 from contextlib import asynccontextmanager
 
+# Global flag
+model = None
+tokenizer = None
+model_ready = False
+download_lock = threading.Lock()
 
 TRAINING_SCRIPT = "train_phi2_lora.py"
-DATASET_DIR = "/workspace/data/datasets"
-TRAINING_LOG = "/workspace/training.log"
-TESTING_SCRIPT = "evaluate_phi2_lora.py"
+DATASET_DIR = "../workspace/data/datasets"
+TRAINING_LOG = "../workspace/training.log"
+TESTING_SCRIPT = "evaluate_phi2.py"
 TEST_SET_PATH_PRETRAIN = "./data/test/mortgage_finetune_1000.jsonl"
 TEST_SET_PATH_FINETUNE = "./data/test/mortgage_finetune_1000.jsonl"
-TEST_RESULTS_DIR = "/workspace/data/test/results"
-TESTING_LOG = "/workspace/testing.log"
-STATUS_FILE = "/workspace/training_status.json"
-MODEL_PATH = "/workspace/data/models/phi2-mortgage-lora"
-TOKENIZER_PATH = MODEL_PATH
-LOCAL_MODEL_PATH_PRETRAIN = "/workspace/data/models/phi2-base"
-LOCAL_MODEL_PATH_FINETUNED = "/workspace/data/models/phi2-finetune"
+TEST_RESULTS_DIR = "../workspace/data/test/results"
+TESTING_LOG = "../workspace/testing.log"
+STATUS_FILE = "../workspace/training_status.json"
+#MODEL_PATH = "/workspace/data/models/phi2-mortgage-lora"
+#TOKENIZER_PATH = MODEL_PATH
+LOCAL_MODEL_PATH_PRETRAIN = "../workspace/data/models/phi2-base"
+LOCAL_MODEL_PATH_FINETUNED = "../workspace/data/models/phi2-finetune"
 HF_MODEL_PATH = "GrahamWall/phi2-finetune"
 local_files_only_computed = None
 trust_remote_code_computed = None
 
-model_path = None
+model_path = LOCAL_MODEL_PATH_PRETRAIN
+test_set_path = None
 
-# Check for local files
+sys.stdout.reconfigure(line_buffering=True)
+
+def background_download():
+    global model, tokenizer, model_ready
+
+    try:
+        print(f"[DEBUG] Downloading model {model_path} to {LOCAL_MODEL_PATH_PRETRAIN}...")
+        snapshot_download(
+            repo_id=HF_MODEL_PATH,
+            local_dir=LOCAL_MODEL_PATH_PRETRAIN,
+            local_dir_use_symlinks=False,
+            resume_download=True,
+        )
+        print("[DEBUG] Model files downloaded ✅")
+
+        print("[DEBUG] Loading model and tokenizer into memory...")
+        with download_lock:
+            model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL_PATH_PRETRAIN, device_map="auto", torch_dtype=torch.float32, local_files_only=True, trust_remote_code=True)
+            tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_PATH_PRETRAIN, local_files_only=True, trust_remote_code=True)
+            model_ready = True
+        print("[DEBUG] Model and tokenizer loaded ✅")
+
+    except Exception as e:
+        print(f"[ERROR] Model download or load failed: {e}")
+        model_ready = False
+
+def get_missing_files(path):
+    base_required = [
+        "config.json",
+        "generation_config.json",
+        "model.safetensors.index.json",
+    ]
+
+    adapter_required = [
+        "adapter_model.safetensors",
+        "adapter_config.json",
+    ]
+
+    tokenizer_required = [
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "vocab.json",
+        "added_tokens.json",
+        "special_tokens_map.json",
+    ]
+
+    # Adapter-only case
+    adapter_missing = [f for f in adapter_required if not os.path.isfile(os.path.join(path, f))]
+    if not adapter_missing:
+        return []  # All adapter files present, return empty list (no missing files)
+
+    # Full model case: need to parse index file for shard names
+    index_path = os.path.join(path, "model.safetensors.index.json")
+    if not os.path.isfile(index_path):
+        return base_required + tokenizer_required  # Missing index file: assume all base files missing
+
+    try:
+        import json
+        with open(index_path, "r") as f:
+            index_data = json.load(f)
+        weight_map = index_data.get("weight_map", {})
+        shard_files = list(set(weight_map.values()))
+    except Exception as e:
+        print(f"[ERROR] Reading index.json failed: {e}")
+        return base_required + tokenizer_required
+
+    full_required = base_required + shard_files + tokenizer_required
+    return [f for f in full_required if not os.path.isfile(os.path.join(path, f))]
+
 def model_files_exist(path):
-    required_files = ["added_tokens.json", 
-                      "config.json", 
-                      "generation_config.json", 
-                      "model-00001-of-00002.safetensors", 
-                      "model-00002-of-00002.safetensors", 
-                      "model.safetensors.index.json", 
-                      "special_tokens_map.json", 
-                      "tokenizer_config.json", 
-                      "tokenizer.json", 
-                      "vocab.json"]
-    return all(os.path.isfile(os.path.join(path, f)) for f in required_files)
+    missing = get_missing_files(path)
+    if missing:
+        print(f"🛑 Missing model files in {path}:")
+        for f in missing:
+            print(f" - {f}")
+        return False
+    print("✅ All required model files present.")
+    return True
 
 # Decide where to load from
 if os.path.isdir(LOCAL_MODEL_PATH_PRETRAIN) and model_files_exist(LOCAL_MODEL_PATH_PRETRAIN):
@@ -65,8 +138,8 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.float32 if torch.cuda.is_available() else torch.float32
 MAX_NUM_TOKENS = 100 if torch.cuda.is_available() else 1
 
-print(f"[DEBUG] torch.cuda.is_available(): {torch.cuda.is_available()}")
-print(f"[DEBUG] Dtype selected: {dtype}")
+#print(f"[DEBUG] torch.cuda.is_available(): {torch.cuda.is_available()}")
+#print(f"[DEBUG] Dtype selected: {dtype}")
 
 def generate_text(prompt: str) -> str:
     inputs = tokenizer(prompt, return_tensors="pt")
@@ -76,42 +149,73 @@ def generate_text(prompt: str) -> str:
 # --- FASTAPI SETUP ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global model, tokenizer
+    global model, tokenizer, model_ready
+    print("[DEBUG] FastAPI lifespan started")
     print("[DEBUG] Starting up app")
-    try:
-        print("[DEBUG] Attempting to load model...")
-        #model_path = os.getenv("MODEL_PATH", "/workspace/data/models/microsoft/phi-2")
+    # Check if all required files exist
+    if not model_files_exist(model_path):
+        print("🛑 Model files not found. Starting background download...")
+        threading.Thread(target=background_download, daemon=True).start()
+    else:
+        print(f"✅ Loading model from local path: {model_path}")
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            device_map="auto",
             torch_dtype=dtype,
-            local_files_only=local_files_only_computed,
-            trust_remote_code=trust_remote_code_computed,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            trust_remote_code=True,
         )
         print("[DEBUG] Model loaded successfully ✅")
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_path, 
-            local_files_only=local_files_only_computed, 
-            trust_remote_code=trust_remote_code_computed,
-        )
-        print("[DEBUG] Tokenizer loaded ✅")
-        test_output = generate_text("Hello, world!")
-        print(f"[DEBUG] Startup generation success: {test_output}")
-        # if we loaded from HF successfully, save to local path for next time
-        if model_path == HF_MODEL_PATH:
-            # Create directory if it doesn't exist
-            os.makedirs(LOCAL_MODEL_PATH_PRETRAIN, exist_ok=True)
-            model.save_pretrained(LOCAL_MODEL_PATH_PRETRAIN)
-            tokenizer.save_pretrained(LOCAL_MODEL_PATH_PRETRAIN)
-    except Exception as e:
-        print(f"[ERROR] Exception during model loading: {str(e)}")
-        raise
+        model_ready = True
+
     yield
     print("[DEBUG] Shutting down app")
 
 app = FastAPI(lifespan=lifespan)
 print("[DEBUG] FastAPI app created ✅")
 
+# Add this CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Or restrict to your GitHub Pages domain
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+print("[DEBUG] CORS middleware added ✅")
+
+pipe = None  # global declaration
+
+@app.post("/chat")
+async def chat(request: Request):
+    global pipe, model_ready, model, tokenizer
+
+    if not model_ready or model is None or tokenizer is None:
+        return JSONResponse({"error": "Model not ready"}, status_code=503)
+    
+    if pipe is None:
+        pipe = TextGenerationPipeline(model=model, tokenizer=tokenizer)
+
+    data = await request.json()
+    prompt = data.get("prompt", "")
+    print(f"[DEBUG] Received prompt: {prompt}")
+    if not prompt:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Missing 'prompt' in request body."}
+        )
+
+    try:
+        result = pipe(prompt, max_new_tokens=256, do_sample=True)[0]["generated_text"]
+        return {"response": result}
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Model generation failed: {str(e)}"}
+        )
 
 # Global state
 training_proc: Optional[subprocess.Popen] = None
@@ -161,48 +265,71 @@ def start_training():
     thread.start()
     return {"message": "Training started in background"}
 
-def run_testing(model_path: str):
-    global testing_proc
-    start_time = time.time()
-    with open(STATUS_FILE, "w") as f:
-        json.dump({"status": "testing_started", "start_time": start_time}, f)
+def run_testing():
+    global test_status, test_start_time, test_end_time, latest_results
+    test_status = "testing_started"
+    test_start_time = time.time()
 
-    with open(TESTING_LOG, "w") as log_file:
-        testing_proc = subprocess.Popen(
-            ["accelerate", "launch", TESTING_SCRIPT, "--model_path", model_path],
-            stdout=log_file,
-            stderr=subprocess.STDOUT
+    with open("testing.log", "w") as log_file:
+        process = subprocess.Popen(
+            ["accelerate", "launch", "evaluate_phi2.py", "--model_path", model_path, "--test_set_path", test_set_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
         )
-        testing_proc.wait()
+        for line in process.stdout:
+            print(line, end="")             # stream to console
+            log_file.write(line)            # write to log file
+        process.wait()
 
-    end_time = time.time()
-    duration = round(end_time - start_time, 2)
-    with open(STATUS_FILE, "w") as f:
-        json.dump({
-            "status": "testing_complete",
-            "start_time": start_time,
-            "end_time": end_time,
-            "duration_sec": duration
-        }, f)
+    test_end_time = time.time()
+    test_status = "testing_complete"
 
 @app.post("/test-pretrain-performance")
 def test_model_pretrain():
+    global model_path, test_set_path
     global testing_proc
+
+    if not model_ready:
+        return {"error": "Model not ready yet. Try again later."}
+    
+    # Proceed with testing...
     if testing_proc and testing_proc.poll() is None:
         return {"error": "Testing already in progress"}
 
-    thread = threading.Thread(target=run_testing, args=(LOCAL_MODEL_PATH_PRETRAIN, TEST_SET_PATH_PRETRAIN))
+    model_path = LOCAL_MODEL_PATH_PRETRAIN
+    test_set_path = TEST_SET_PATH_PRETRAIN
+    thread = threading.Thread(target=run_testing)
     thread.start()
     return {"message": "Testing started in background"}
+
+def get_latest_checkpoint(path):
+    checkpoints = [d for d in os.listdir(path) if d.startswith("checkpoint-")]
+    if not checkpoints:
+        raise ValueError("No checkpoints found in path.")
+    latest = max(checkpoints, key=lambda x: int(x.split("-")[-1]))
+    return os.path.join(path, latest)
 
 @app.post("/test-finetune-performance")
 def test_model_finetune():
     global testing_proc
+    global model_path, test_set_path
+
+    if not model_ready:
+        return {"error": "Model not ready yet. Try again later."}
+    
+    # Proceed with testing...
     if testing_proc and testing_proc.poll() is None:
         return {"error": "Testing already in progress"}
 
-    thread = threading.Thread(target=run_testing, args=(LOCAL_MODEL_PATH_FINETUNED, TEST_SET_PATH_FINETUNE))
-    thread.start()
+    test_set_path = TEST_SET_PATH_FINETUNE
+    model_path = get_latest_checkpoint(LOCAL_MODEL_PATH_FINETUNED)
+    if model_path is None:
+        return {"error": "No checkpoints found for finetuned model."}
+    else:
+        print(f"Using latest checkpoint: {model_path}")
+        thread = threading.Thread(target=run_testing)
+        thread.start()
     return {"message": "Testing started in background"}
 
 # curl http://localhost:8080/get-latest-results
@@ -245,6 +372,14 @@ def push_model(hub_repo: str):
         return {"message": f"Model and tokenizer pushed to {hub_repo}"}
     except Exception as e:
         return {"error": str(e)}
+
+@app.get("/model_status")
+def get_model_status():
+    return {
+        "ready": model_ready,
+        "model_loaded": model is not None,
+        "missing_files": get_missing_files(LOCAL_MODEL_PATH_PRETRAIN) if not model_ready else []
+    }
 
 @app.get("/status")
 def get_status():
