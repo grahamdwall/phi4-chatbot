@@ -5,21 +5,30 @@ import json
 import torch
 import subprocess
 import threading
-from fastapi import FastAPI, File, UploadFile, BackgroundTasks, Request
+from fastapi import FastAPI, File, UploadFile, BackgroundTasks, Request, Response, Cookie
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Dict, List, Any, TypedDict
 from fastapi.responses import JSONResponse
 from huggingface_hub import HfApi, HfFolder, snapshot_download
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextGenerationPipeline
 from dotenv import load_dotenv
 import glob
 from contextlib import asynccontextmanager
+from uuid import uuid4
+import re
+import traceback
+from mortgage_convo_fsm import MortgageConversation
+
+# git add .
+# git commit -m "Describe your changes here"
+# git push origin main
 
 # Global flag
 model = None
 tokenizer = None
 model_ready = False
+pipe = None
 download_lock = threading.Lock()
 
 TRAINING_SCRIPT = "train_phi2_lora.py"
@@ -34,8 +43,11 @@ STATUS_FILE = "../workspace/training_status.json"
 #MODEL_PATH = "/workspace/data/models/phi2-mortgage-lora"
 #TOKENIZER_PATH = MODEL_PATH
 LOCAL_MODEL_PATH_PRETRAIN = "../workspace/data/models/phi2-base"
+#LOCAL_MODEL_PATH_PRETRAIN = "../workspace/data/models/Phi-4-mini-reasoning"
 LOCAL_MODEL_PATH_FINETUNED = "../workspace/data/models/phi2-finetune"
-HF_MODEL_PATH = "GrahamWall/phi2-finetune"
+#HF_MODEL_PATH = "microsoft/Phi-4-mini-reasoning"
+HF_MODEL_PATH = "microsoft/phi-2"
+#HF_MODEL_PATH = "GrahamWall/phi2-finetune"
 local_files_only_computed = None
 trust_remote_code_computed = None
 
@@ -60,7 +72,7 @@ def background_download():
         print("[DEBUG] Loading model and tokenizer into memory...")
         with download_lock:
             model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL_PATH_PRETRAIN, device_map="auto", torch_dtype=torch.float32, local_files_only=True, trust_remote_code=True)
-            tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_PATH_PRETRAIN, local_files_only=True, trust_remote_code=True)
+            tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_PATH_PRETRAIN, local_files_only=True, trust_remote_code=True, use_fast=True) # Change to GPT2TokenizerFast
             model_ready = True
         print("[DEBUG] Model and tokenizer loaded ✅")
 
@@ -136,7 +148,7 @@ else:
 # Detect device
 device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.float32 if torch.cuda.is_available() else torch.float32
-MAX_NUM_TOKENS = 100 if torch.cuda.is_available() else 1
+MAX_NUM_TOKENS = 256 if torch.cuda.is_available() else 1
 
 #print(f"[DEBUG] torch.cuda.is_available(): {torch.cuda.is_available()}")
 #print(f"[DEBUG] Dtype selected: {dtype}")
@@ -167,7 +179,16 @@ async def lifespan(app: FastAPI):
         tokenizer = AutoTokenizer.from_pretrained(
             model_path,
             trust_remote_code=True,
+            use_fast=True  # Important for GPT2TokenizerFast
         )
+        print("[DEBUG] Tokenizer class:", type(tokenizer))
+        print("[DEBUG] Tokenizer special tokens:", tokenizer.special_tokens_map)
+        print("[DEBUG] Tokenizer padding side:", tokenizer.padding_side)
+        print("[DEBUG] Tokenizer truncation side:", tokenizer.truncation_side)
+        print("[DEBUG] Tokenizer model_max_length:", tokenizer.model_max_length)
+        print("[DEBUG] Tokenizer all_special_tokens:", tokenizer.all_special_tokens)
+        print("[DEBUG] Tokenizer all_special_ids:", tokenizer.all_special_ids)        
+
         print("[DEBUG] Model loaded successfully ✅")
         model_ready = True
 
@@ -176,6 +197,38 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 print("[DEBUG] FastAPI app created ✅")
+
+# Conversation data structure with timestamps and FSM
+class SessionData(TypedDict, total=False):
+    history: list
+    last_updated: float
+    fsm: MortgageConversation
+
+conversation_state: Dict[str, SessionData] = {}
+
+# Lock for thread-safe operations
+conversation_lock = threading.Lock()
+
+# Session timeout in seconds (60 mins)
+SESSION_TIMEOUT = 60 * 60
+
+def cleanup_inactive_sessions():
+    """Background thread to periodically clean up inactive sessions."""
+    while True:
+        with conversation_lock:
+            current_time = time.time()
+            expired_sessions = [
+                sid for sid, data in conversation_state.items()
+                if current_time - data['last_updated'] > SESSION_TIMEOUT
+            ]
+            for sid in expired_sessions:
+                del conversation_state[sid]
+                print(f"Session {sid} deleted due to inactivity.")
+        # Sleep 10 minutes before next cleanup
+        time.sleep(600)
+
+# Start background thread
+threading.Thread(target=cleanup_inactive_sessions, daemon=True).start()
 
 # Add this CORS middleware
 app.add_middleware(
@@ -187,31 +240,261 @@ app.add_middleware(
 )
 print("[DEBUG] CORS middleware added ✅")
 
-pipe = None  # global declaration
+def extract_mortgage_parameters(text: str, fsm) -> Dict:
+    """
+    Extracts mortgage parameters from natural language text.
+    Looks for:
+    - Interest rate (as percent or decimal)
+    - Principal/loan amount
+    - Term in years, months, weeks, or days
+    - Payment frequency
+    """
+    params = {}
+
+    try:
+        # --- Principal / Loan Amount ---
+        match = re.search(r"(?:\$|\bloan(?: amount)? of )\s?(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+)", text, re.IGNORECASE)
+        if match:
+            params["principal"] = float(match.group(1).replace(",", ""))
+            fsm.receive_input('principal', params["principal"])
+
+        # --- Interest Rate (% or decimal) ---
+        match = re.search(r"(\d+(?:\.\d+)?)\s*%", text)  # percentage
+        if match:
+            params["interest_rate"] = float(match.group(1)) / 100
+            fsm.receive_input('interest_rate', params["interest_rate"])
+        else:
+            match = re.search(r"interest rate (?:of )?(\d+\.\d+)", text, re.IGNORECASE)  # decimal
+            if match:
+                rate = float(match.group(1))
+                # Treat < 1 as already decimal (0.04), otherwise convert
+                params["interest_rate"] = rate if rate < 1 else rate / 100
+                fsm.receive_input('interest_rate', params["interest_rate"])
+
+        # --- Mortgage Term (normalized to years) ---
+        match = re.search(r"(\d+(?:\.\d+)?)\s*(year|month|week|day)s?", text, re.IGNORECASE)
+        if match:
+            length = float(match.group(1))
+            unit = match.group(2).lower()
+
+            # Normalize to years
+            conversion_factors = {
+                "year": 1,
+                "month": 1 / 12,
+                "week": 1 / 52,
+                "day": 1 / 365
+            }
+
+            years = length * conversion_factors.get(unit, 0)
+
+            params["term_years"] = years
+            fsm.receive_input('term_years', params["term_years"])
+
+        # --- Payment Frequency ---
+        match = re.search(r"(weekly|bi[-\s]?weekly|monthly|quarterly|annually|yearly)", text, re.IGNORECASE)
+        if match:
+            freq = match.group(1).lower().replace(" ", "").replace("-", "")
+            # normalize terms
+            frequency_map = {
+                "weekly": "weekly",
+                "biweekly": "bi-weekly",
+                "monthly": "monthly",
+                "quarterly": "quarterly",
+                "annually": "annually",
+                "yearly": "annually"
+            }
+            params["payment_frequency"] = frequency_map.get(freq, freq)
+
+    except Exception as e:
+        print(f"[WARNING] Parameter extraction failed: {e}")
+
+    return params
+
+def calculate_monthly_payment(fsm: MortgageConversation) -> str:
+    """Calculates the monthly mortgage payment."""
+
+    try:
+        if fsm.state != "ready":
+            return "Not enough information to calculate the mortgage payment."
+        else:
+            n = fsm.collected_data["term_years"] * 12  # Total number of payments
+            r = fsm.collected_data["interest_rate"] / 12  # Monthly interest rate
+
+            if r == 0:
+                return fsm.collected_data["principal"] / n
+            payment = fsm.collected_data["principal"] * (r * (1 + r)**n) / ((1 + r)**n - 1)
+            return f"The estimated monthly payment is: ${payment:.2f}"
+    except Exception as e:
+        return f"Calculation error: {e}"
+
+system_context_general = (
+    "You are a helpful but very concise and not verbose assistant whose task is to help users located in Ontario, Canada "
+    "to estimate their payments on a mortgage given a certain "
+    "principal loan amount and interest rate, or other special mortgage scenarios like balloon payments. "
+    "Answers should be short and no longer than 250 characters. "
+    "The following values needed are still needed for the calculation: "
+)
+
+system_context_principal = (
+    "principal loan amount "
+)
+
+system_context_interest_rate = (
+    "interest rate "
+)
+
+system_context_payment_frequency = (
+    "interest payment frequency "
+)
+
+system_context_term_years = (
+    "length of the term of the mortgage "
+)
+
+system_context_result = (
+    "Notify the user concisely of the result of the calculations: "
+)
+
+prompt_parts = {
+    "general": system_context_general,
+    "principal": system_context_principal,
+    "interest_rate": system_context_interest_rate,
+    "term_years": system_context_term_years,
+    "payment_frequency": system_context_payment_frequency,
+    "result": system_context_result,
+}
+
+def generate_response(prompt: str, pipe, fsm) -> str:
+    """Generates the initial text response from the LLM."""
+    global system_context
+    
+    extract_mortgage_parameters(prompt, fsm)
+
+    # select the message to add to general context based on what information it still needs in order to calculate mortgage
+    print(f"[DEBUG]Still needed: {fsm.missing_fields()}")
+    missing = fsm.missing_fields()
+    if fsm.state == "ready":
+        # do calculation, and add result to system context to report result to user
+        calculation_result = calculate_monthly_payment(fsm)
+        system_context = " ".join([prompt_parts["general"], prompt_parts["result"], " ".join(calculation_result)])
+    else:
+        prompts_for_missing = [prompt_parts[k] for k in missing if k in prompt_parts]
+        system_context = " ".join([prompt_parts["general"], " ".join(prompts_for_missing)])
+
+    full_prompt = f"{system_context}\n\nUser: {prompt}\nAssistant:"
+
+    try:
+        outputs = pipe(
+            full_prompt,
+            max_new_tokens=256,
+            do_sample=True
+            #eos_token_id=tokenizer.eos_token_id,
+            #pad_token_id=tokenizer.eos_token_id,
+            #stop_sequence=["\n\n", "</s>", "<|endoftext|>"]
+        )
+        if not outputs or "generated_text" not in outputs[0]:
+            raise ValueError("Model output missing 'generated_text'")
+
+        ai_response = outputs[0]["generated_text"]
+        # Find split point and extract just the assistant's reply
+        split_marker = f"User: {prompt}\nAssistant:"
+        if split_marker in ai_response:
+            ai_response = ai_response.split(split_marker)[-1].strip()
+        else:
+            ai_response = ai_response.strip()
+        # Only keep the assistant's part before the AI hallucinates another user turn
+        stop_marker = "\nUser:"
+        if stop_marker in ai_response:
+            ai_response = ai_response.split(stop_marker)[0].strip()
+        else:
+            ai_response = ai_response.strip()            
+        print(f"[DEBUG] Cleaned AI response: {repr(ai_response)}") 
+        return ai_response
+    except Exception as e:
+        traceback.print_exc()
+        print(f"[ERROR] Error during generation: {e}")  # Log the detailed error
+        return "Sorry, I encountered an error while generating a response."  # Generic user message
 
 @app.post("/chat")
-async def chat(request: Request):
+async def chat_endpoint(
+    request: Request, 
+    response: Response, 
+    session_id: Optional[str] = Cookie(None)
+    ):
     global pipe, model_ready, model, tokenizer
 
     if not model_ready or model is None or tokenizer is None:
         return JSONResponse({"error": "Model not ready"}, status_code=503)
     
+    print("[DEBUG] Tokenizer config:", tokenizer.special_tokens_map, tokenizer.padding_side, tokenizer.truncation_side)
+
+    print(f"[DEBUG] Entering /chat, pipe is: {pipe}") 
     if pipe is None:
         pipe = TextGenerationPipeline(model=model, tokenizer=tokenizer)
+        print(f"[DEBUG] Initialized pipe: {pipe}, pipe.device: {getattr(pipe, 'device', None)}")
+        print("[DEBUG] Pipe tokenizer class:", type(pipe.tokenizer))
+    print(f"[DEBUG] After initialization check, pipe is: {pipe}, pipe.device: {getattr(pipe, 'device', None)}")
 
-    data = await request.json()
-    prompt = data.get("prompt", "")
-    print(f"[DEBUG] Received prompt: {prompt}")
-    if not prompt:
+    req_json = await request.json()
+    user_message = req_json.get('prompt', '').strip()
+    #user_message = user_message.strip()  # Remove leading/trailing whitespace
+    #user_message = re.sub(r'[\r\n]+', ' ', user_message)  # Normalize newlines
+    print(f"[DEBUG] Received prompt: {user_message}")
+    if not user_message:
         return JSONResponse(
             status_code=400,
             content={"error": "Missing 'prompt' in request body."}
+        )    
+    if not isinstance(user_message, str) or not user_message:
+        print(f"[ERROR] Invalid user message: {repr(user_message)}")
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Invalid prompt received. Must be non-empty string."}
         )
 
+    print(f"[DEBUG] Calling model pipeline with: {repr(user_message)}")
+
+    if not session_id:
+        session_id = str(uuid4())
+        response.set_cookie(key="session_id", value=session_id, httponly=True, max_age=SESSION_TIMEOUT)
+
+    with conversation_lock:
+        # Initialize session if it doesn't exist
+        session = conversation_state.setdefault(session_id, {
+            "history": [],
+            "last_updated": time.time(),
+            "fsm": MortgageConversation()
+        })
+
+    # Update session with new message
+    session["history"].append({"user": user_message})
+    session["last_updated"] = time.time()
+
+    # Generate AI response
     try:
-        result = pipe(prompt, max_new_tokens=256, do_sample=True)[0]["generated_text"]
-        return {"response": result}
+        stop_sequences = ["\n\n", "</s>", "<|endoftext|>"]
+        encoded_stop_sequences = []
+        for seq in stop_sequences:
+            try:
+                encoded = tokenizer.encode(seq, add_special_tokens=False)
+                encoded_stop_sequences.append(encoded)
+                print(f"[DEBUG] Encoded '{seq}': {encoded}")
+            except Exception as e:
+                print(f"[ERROR] Encoding '{seq}': {e}")
+        print("[DEBUG] All encoded stop sequences:", encoded_stop_sequences)
+        #stop_sequence_ids = [tokenizer.encode(seq, add_special_tokens=False) for seq in stop_sequences]
+        #print("[DEBUG] Stop sequence ids:", stop_sequence_ids)
+        print("[DEBUG] eos_token_id:", tokenizer.eos_token_id)
+
+        fsm = session["fsm"]
+        ai_response = generate_response(user_message, pipe, fsm)  # Generate initial response
+        print(f"[DEBUG] Raw model output: {ai_response}")  # Log the raw output
+
+        session["history"].append({"bot": ai_response})
+        return {"response": ai_response}
     except Exception as e:
+        print(f"[ERROR] Model generation failed: {str(e)}")
+        print(traceback.print_exc())  # Log the full traceback        
         return JSONResponse(
             status_code=500,
             content={"error": f"Model generation failed: {str(e)}"}
