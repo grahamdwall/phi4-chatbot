@@ -181,13 +181,13 @@ async def lifespan(app: FastAPI):
             trust_remote_code=True,
             use_fast=True  # Important for GPT2TokenizerFast
         )
-        print("[DEBUG] Tokenizer class:", type(tokenizer))
-        print("[DEBUG] Tokenizer special tokens:", tokenizer.special_tokens_map)
-        print("[DEBUG] Tokenizer padding side:", tokenizer.padding_side)
-        print("[DEBUG] Tokenizer truncation side:", tokenizer.truncation_side)
-        print("[DEBUG] Tokenizer model_max_length:", tokenizer.model_max_length)
-        print("[DEBUG] Tokenizer all_special_tokens:", tokenizer.all_special_tokens)
-        print("[DEBUG] Tokenizer all_special_ids:", tokenizer.all_special_ids)        
+        #print("[DEBUG] Tokenizer class:", type(tokenizer))
+        #print("[DEBUG] Tokenizer special tokens:", tokenizer.special_tokens_map)
+        #print("[DEBUG] Tokenizer padding side:", tokenizer.padding_side)
+        #print("[DEBUG] Tokenizer truncation side:", tokenizer.truncation_side)
+        #print("[DEBUG] Tokenizer model_max_length:", tokenizer.model_max_length)
+        #print("[DEBUG] Tokenizer all_special_tokens:", tokenizer.all_special_tokens)
+        #print("[DEBUG] Tokenizer all_special_ids:", tokenizer.all_special_ids)        
 
         print("[DEBUG] Model loaded successfully ✅")
         model_ready = True
@@ -211,6 +211,27 @@ conversation_lock = threading.Lock()
 
 # Session timeout in seconds (60 mins)
 SESSION_TIMEOUT = 60 * 60
+SESSION_COOKIE_NAME = "session_id"
+
+def get_session_id_from_request(request: Request, response: Response) -> str:
+    """
+    Retrieves the session ID from cookies or creates a new one if missing.
+    Also sets the cookie on the response.
+    """
+    session_id: Optional[str] = request.cookies.get(SESSION_COOKIE_NAME)
+    
+    if not session_id:
+        session_id = str(uuid4())
+        response.set_cookie(
+            key=SESSION_COOKIE_NAME,
+            value=session_id,
+            httponly=True,
+            max_age=SESSION_TIMEOUT,
+            samesite="None",      # ✅ must be "None" for cross-site use
+            secure=True           # ✅ required for samesite="None" to work            
+        )
+    
+    return session_id
 
 def cleanup_inactive_sessions():
     """Background thread to periodically clean up inactive sessions."""
@@ -416,26 +437,49 @@ def generate_response(prompt: str, pipe, fsm) -> str:
         return "Sorry, I encountered an error while generating a response."  # Generic user message
 
 @app.post("/chat")
-async def chat_endpoint(
-    request: Request, 
-    response: Response, 
-    session_id: Optional[str] = Cookie(None)
-    ):
+async def chat_endpoint(request: Request):
     global pipe, model_ready, model, tokenizer
+
+    req_json = await request.json()
+    session_id = req_json.get("session_id")
+    if not session_id:
+        session_id = str(uuid4())
+    with conversation_lock:
+        session = conversation_state.setdefault(session_id, {
+            "history": [],
+            "last_updated": time.time(),
+            "fsm": MortgageConversation()
+        })
+    user_message = req_json.get("prompt", "").strip()
+    print(f"[DEBUG] Session ID: {session_id} | Prompt: {user_message}")
+
+    with conversation_lock:
+        # Initialize session if it doesn't exist
+        session = conversation_state.setdefault(session_id, {
+            "history": [],
+            "last_updated": time.time(),
+            "fsm": MortgageConversation()
+        })
+
+    print(f"[DEBUG] Session exists? {'yes' if session_id in conversation_state else 'no'}")
+
+    print(f"[DEBUG] Session ID: {session_id}")
+    print(f"[DEBUG] Session ID: {session_id} | Active sessions: {len(conversation_state)}")
+    print(f"[DEBUG] Session ID: {session_id} | Last updated: {conversation_state[session_id]['last_updated']}")
 
     if not model_ready or model is None or tokenizer is None:
         return JSONResponse({"error": "Model not ready"}, status_code=503)
     
-    print("[DEBUG] Tokenizer config:", tokenizer.special_tokens_map, tokenizer.padding_side, tokenizer.truncation_side)
+    #print("[DEBUG] Tokenizer config:", tokenizer.special_tokens_map, tokenizer.padding_side, tokenizer.truncation_side)
 
-    print(f"[DEBUG] Entering /chat, pipe is: {pipe}") 
+    #print(f"[DEBUG] Entering /chat, pipe is: {pipe}") 
     if pipe is None:
         pipe = TextGenerationPipeline(model=model, tokenizer=tokenizer)
-        print(f"[DEBUG] Initialized pipe: {pipe}, pipe.device: {getattr(pipe, 'device', None)}")
-        print("[DEBUG] Pipe tokenizer class:", type(pipe.tokenizer))
-    print(f"[DEBUG] After initialization check, pipe is: {pipe}, pipe.device: {getattr(pipe, 'device', None)}")
+        #print(f"[DEBUG] Initialized pipe: {pipe}, pipe.device: {getattr(pipe, 'device', None)}")
+        #print("[DEBUG] Pipe tokenizer class:", type(pipe.tokenizer))
+    #print(f"[DEBUG] After initialization check, pipe is: {pipe}, pipe.device: {getattr(pipe, 'device', None)}")
 
-    req_json = await request.json()
+    #req_json = await request.json()
     user_message = req_json.get('prompt', '').strip()
     #user_message = user_message.strip()  # Remove leading/trailing whitespace
     #user_message = re.sub(r'[\r\n]+', ' ', user_message)  # Normalize newlines
@@ -453,18 +497,6 @@ async def chat_endpoint(
         )
 
     print(f"[DEBUG] Calling model pipeline with: {repr(user_message)}")
-
-    if not session_id:
-        session_id = str(uuid4())
-        response.set_cookie(key="session_id", value=session_id, httponly=True, max_age=SESSION_TIMEOUT)
-
-    with conversation_lock:
-        # Initialize session if it doesn't exist
-        session = conversation_state.setdefault(session_id, {
-            "history": [],
-            "last_updated": time.time(),
-            "fsm": MortgageConversation()
-        })
 
     # Update session with new message
     session["history"].append({"user": user_message})
