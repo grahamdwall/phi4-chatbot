@@ -9,6 +9,8 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV LANG=C.UTF-8
 ENV HF_HOME=/workspace/data/models
 ENV TRANSFORMERS_VERBOSITY=debug
+# Set NLTK data path for all Python scripts in the container
+ENV NLTK_DATA=/root/nltk_data
 
 # Install Python build dependencies + git + lib dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -36,6 +38,14 @@ RUN pip install --no-cache-dir torch==2.1.2+cu121 --index-url https://download.p
 # Then install the rest of the requirements from your requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Download the spaCy model (en_core_web_sm)
+#RUN mkdir -p ./spacy
+#ENV SPACY_DATA_PATH="./spacy"
+RUN python -m spacy download en_core_web_sm
+
+# Download NLTK data programmatically
+RUN python -m nltk.downloader punkt averaged_perceptron_tagger maxent_ne_chunker words treebank maxent_treebank_pos_tagger
+
 # Add cloudflared
 RUN wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb && \
     dpkg -i cloudflared-linux-amd64.deb && \
@@ -49,6 +59,7 @@ COPY train_phi2_lora.py .
 COPY evaluate_phi2.py .
 COPY train_server.py .
 COPY mortgage_convo_fsm.py .
+COPY mortgage_rates.py .
 COPY start.sh .
 RUN mkdir -p ./data/test
 COPY mortgage_finetune_1000.jsonl ./data/test/
@@ -62,6 +73,9 @@ RUN sysctl -w net.core.rmem_max=2500000 || true
 
 # Copy your baked-in LLM models
 #COPY phi2_model_full/ ./models/microsoft/phi-2
+
+# test spacy so that it won't fail at runtime
+#RUN python -c "import spacy; spacy.load('en_core_web_sm')"
 
 EXPOSE 8000
 

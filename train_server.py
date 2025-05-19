@@ -5,10 +5,10 @@ import json
 import torch
 import subprocess
 import threading
-from fastapi import FastAPI, File, UploadFile, BackgroundTasks, Request, Response, Cookie
+from fastapi import FastAPI, File, UploadFile, BackgroundTasks, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, Dict, List, Any, TypedDict
+from typing import Optional, Dict, List, Any, TypedDict, Union, Tuple
 from fastapi.responses import JSONResponse
 from huggingface_hub import HfApi, HfFolder, snapshot_download
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextGenerationPipeline
@@ -19,6 +19,18 @@ from uuid import uuid4
 import re
 import traceback
 from mortgage_convo_fsm import MortgageConversation
+from mortgage_rates import get_interest_rate, calculate_cmhc_insurance, calculate_min_downpayment
+import locationtagger
+import nltk
+nltk.download('maxent_ne_chunker')
+nltk.download('words')
+nltk.download('treebank')
+nltk.download('maxent_treebank_pos_tagger')
+nltk.download('punkt')
+nltk.download('averaged_perceptron_tagger')
+from urllib.parse import urlparse
+
+# python -m spacy download en_core_web_sm
 
 # git add .
 # git commit -m "Describe your changes here"
@@ -148,7 +160,7 @@ else:
 # Detect device
 device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.float32 if torch.cuda.is_available() else torch.float32
-MAX_NUM_TOKENS = 256 if torch.cuda.is_available() else 1
+MAX_NUM_TOKENS = 2048   # limitation of Phi-2
 
 #print(f"[DEBUG] torch.cuda.is_available(): {torch.cuda.is_available()}")
 #print(f"[DEBUG] Dtype selected: {dtype}")
@@ -165,9 +177,11 @@ async def lifespan(app: FastAPI):
     print("[DEBUG] FastAPI lifespan started")
     print("[DEBUG] Starting up app")
     # Check if all required files exist
+    download_started = False
     if not model_files_exist(model_path):
         print("🛑 Model files not found. Starting background download...")
         threading.Thread(target=background_download, daemon=True).start()
+        download_started = True
     else:
         print(f"✅ Loading model from local path: {model_path}")
         model = AutoModelForCausalLM.from_pretrained(
@@ -192,6 +206,18 @@ async def lifespan(app: FastAPI):
         print("[DEBUG] Model loaded successfully ✅")
         model_ready = True
 
+    # Wait for model to be ready if it was downloading
+    if download_started:
+        print("[DEBUG] Waiting for background model download to finish...")
+        for _ in range(60*60):  # wait up to 1 hour (could be throttled)
+            if model_ready:
+                print("[DEBUG] Model download complete ✅")
+                break
+            time.sleep(1)
+        else:
+            print("[ERROR] Model did not become ready in time.")
+            raise RuntimeError("Model failed to load during app startup")
+        
     yield
     print("[DEBUG] Shutting down app")
 
@@ -211,27 +237,6 @@ conversation_lock = threading.Lock()
 
 # Session timeout in seconds (60 mins)
 SESSION_TIMEOUT = 60 * 60
-SESSION_COOKIE_NAME = "session_id"
-
-def get_session_id_from_request(request: Request, response: Response) -> str:
-    """
-    Retrieves the session ID from cookies or creates a new one if missing.
-    Also sets the cookie on the response.
-    """
-    session_id: Optional[str] = request.cookies.get(SESSION_COOKIE_NAME)
-    
-    if not session_id:
-        session_id = str(uuid4())
-        response.set_cookie(
-            key=SESSION_COOKIE_NAME,
-            value=session_id,
-            httponly=True,
-            max_age=SESSION_TIMEOUT,
-            samesite="None",      # ✅ must be "None" for cross-site use
-            secure=True           # ✅ required for samesite="None" to work            
-        )
-    
-    return session_id
 
 def cleanup_inactive_sessions():
     """Background thread to periodically clean up inactive sessions."""
@@ -254,183 +259,453 @@ threading.Thread(target=cleanup_inactive_sessions, daemon=True).start()
 # Add this CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Or restrict to your GitHub Pages domain
+    allow_origins=["*"],    # Allows all origins
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 print("[DEBUG] CORS middleware added ✅")
 
-def extract_mortgage_parameters(text: str, fsm) -> Dict:
+def extract_price(text: str) -> Optional[float]:
+    """
+    Extracts the property price from the text.
+    """
+    match = re.search(r"(?:\$|\bprice(?: amount)? of )\s?(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+)", text, re.IGNORECASE)
+    if match:
+        start, end = match.span()
+        result = float(match.group(1).replace(",", ""))
+        return {"value": result, "span": (start, end)}
+    return None
+
+
+def is_likely_url(text: str) -> bool:
+    parsed = urlparse(text)
+    return all([parsed.scheme, parsed.netloc])
+
+# sample_text = "I recently moved from Toronto to Vancouver, and I plan to visit Montreal and Ottawa next month."
+# locations = extract_locations(sample_text)
+# print(locations)
+def extract_locations(text: str) -> Dict[str, List[Dict[str, Tuple[int, int]]]]:
+    """
+    Extracts location entities from the given text using locationtagger
+    and returns both the names and their character spans.
+
+    Returns:
+        {
+            'countries': [{'name': ..., 'span': (...)}, ...],
+            'regions': [{'name': ..., 'span': (...)}, ...],
+            'cities': [{'name': ..., 'span': (...)}, ...]
+        }
+    """
+    # Avoid misinterpreting non-sentences as URLs
+    if is_likely_url(text.strip()):
+        return {'countries': [], 'regions': [], 'cities': []}
+
+    # Heuristically skip very short inputs
+    if len(text.strip().split()) < 2:
+        return {'countries': [], 'regions': [], 'cities': []}
+
+    print(f"[DEBUG] Extracting locations from: {text}")
+    place_entity = locationtagger.find_locations(text)
+
+    def find_spans(locations: List[str]) -> List[Dict[str, Tuple[int, int]]]:
+        results = []
+        for loc in locations:
+            for match in re.finditer(re.escape(loc), text, re.IGNORECASE):
+                results.append({'name': loc, 'span': match.span()})
+                break  # only record the first occurrence
+        return results
+
+    return {
+        'countries': find_spans(place_entity.countries),
+        'regions': find_spans(place_entity.regions),
+        'cities': find_spans(place_entity.cities)
+    }
+
+def extract_term_years(text: str) -> Optional[float]:
+    """
+    Extracts the mortgage term (amortization period) from the text and normalizes it to years.
+    Filters out mentions related to payment frequency.
+
+    Looks for context like:
+    - "amortization period is 25 years"
+    - "loan term of 30 years"
+    - "repay over 20 years"
+    """
+
+    normalized = text.lower()
+
+    # Terms that usually signal amortization or loan duration
+    anchors = [
+        r"(amortization|loan term|loan duration|repay(?:ment)?(?: over)?|mortgage term|term of|for a term of)",
+    ]
+
+    # Time expression pattern
+    time_expr = r"(\d+(?:\.\d+)?)\s*(year|month|week|day)s?"
+
+    # Look for anchored term expressions
+    for anchor in anchors:
+        match = re.search(anchor + r".*?" + time_expr, normalized)
+        if match:
+            start, end = match.span()
+            value = float(match.group(2))
+            unit = match.group(3).lower()
+            factor = {
+                "year": 1, "month": 1 / 12, "week": 1 / 52, "day": 1 / 365
+            }.get(unit, 0)
+            return {"value": value * factor, "span": (start, end)}
+    return None
+
+def extract_payment_frequency(text: str) -> Optional[Dict[str, Union[str, tuple]]]:
+    """
+    Extracts the payment frequency from the text and returns the value with its character span.
+
+    Recognizes:
+    - weekly
+    - bi-weekly / biweekly
+    - accelerated weekly / bi-weekly
+    - semi-monthly
+    - bi-monthly
+    - every 2 weeks
+    - monthly, quarterly, annually/yearly
+    """
+    normalized_text = text.lower()
+
+    patterns = [
+        (r"accelerated\s+bi\s*weekly", "accelerated bi-weekly"),
+        (r"accelerated\s+weekly", "accelerated weekly"),
+        (r"bi\s*weekly", "bi-weekly"),
+        (r"weekly", "weekly"),
+        (r"semi\s*monthly", "semi-monthly"),
+        (r"bi\s*monthly", "bi-monthly"),
+        (r"every\s+2\s+weeks?", "bi-weekly"),
+        (r"monthly", "monthly"),
+        (r"quarterly", "quarterly"),
+        (r"(annually|yearly)", "annually"),
+    ]
+
+    for pattern, label in patterns:
+        match = re.search(pattern, normalized_text)
+        if match:
+            return {"value": label, "span": match.span()}
+
+    return None
+
+#def extract_interest_rate(text: str) -> Optional[float]:
+#    """
+#    Extracts the interest rate from the text.
+#    """
+#    match = re.search(r"(\d+(?:\.\d+)?)\s*%?", text)
+#    if match:
+#        return float(match.group(1))
+#    return None
+
+def extract_first_time_home_buyer(text: str) -> Optional[Dict[str, Union[bool, tuple]]]:
+    """
+    Attempts to determine if the user is a first-time home buyer.
+
+    Returns:
+        {
+            "value": True or False,
+            "span": (start_index, end_index)
+        }
+        or None if status is ambiguous or not mentioned
+    """
+    normalized = text.lower()
+
+    # Clear positives
+    positive_patterns = [
+        r"\b(first[-\s]?time)\b.*\b(home[-\s]?buyer|buyer)\b",
+        r"\bnever\b.*\b(bought|owned|purchased)\b.*\b(home|house|property)\b",
+        r"\bi[' ]?m\b.*\bnew to (homeownership|buying a house|real estate)\b",
+    ]
+
+    # Clear negatives
+    negative_patterns = [
+        r"\b(not|n't|never)\b.*\b(first[-\s]?time)\b.*\b(home[-\s]?buyer|buyer)\b",
+        r"\b(already|previously)\b.*\b(bought|owned)\b.*\b(home|house|property)\b",
+        r"\bi (have|had|bought|own)\b.*\b(home|house|property)\b",
+    ]
+
+    for pattern in positive_patterns:
+        match = re.search(pattern, normalized)
+        if match:
+            return {"value": True, "span": match.span()}
+
+    for pattern in negative_patterns:
+        match = re.search(pattern, normalized)
+        if match:
+            return {"value": False, "span": match.span()}
+
+    return None
+
+def extract_down_payment(text: str) -> Optional[Dict[str, Union[str, float, tuple]]]:
+    """
+    Attempts to extract a down payment expressed as either an absolute dollar amount or a percentage.
+
+    Returns:
+        {
+            "type": "absolute" or "percent",
+            "value": float,
+            "span": (start_index, end_index)
+        }
+        or None if not detected
+    """
+    normalized = text.lower()
+
+    # Match absolute dollar amounts
+    abs_match = re.search(
+        r"(?:down\s*payment|putting\s*down|i\s*have|saved\s*up|put\s*down).*?\$?(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+)", 
+        normalized
+    )
+    if abs_match:
+        value = float(abs_match.group(1).replace(",", ""))
+        span = abs_match.span()
+        return {"type": "absolute", "value": value, "span": span}
+
+    # Match percentages (e.g., 5%, 20 %)
+    percent_match = re.search(
+        r"(?:down\s*payment|putting\s*down|planning|saving\s*up)?.*?(\d{1,2}(?:\.\d+)?)\s*%", 
+        normalized
+    )
+    if percent_match:
+        percent = float(percent_match.group(1))
+        span = percent_match.span()
+        return {"type": "percent", "value": percent, "span": span}
+
+    return None
+
+def is_overlapping(span, used_spans):
+    return any(not (span[1] <= s[0] or span[0] >= s[1]) for s in used_spans)
+
+def extract_mortgage_parameters(text: str, fsm) -> Dict[str, Optional[float]]:
     """
     Extracts mortgage parameters from natural language text.
-    Looks for:
-    - Interest rate (as percent or decimal)
-    - Principal/loan amount
-    - Term in years, months, weeks, or days
-    - Payment frequency
     """
     params = {}
+    feedback_messages = []
+    used_spans = []
 
     try:
-        # --- Principal / Loan Amount ---
-        match = re.search(r"(?:\$|\bloan(?: amount)? of )\s?(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+)", text, re.IGNORECASE)
-        if match:
-            params["principal"] = float(match.group(1).replace(",", ""))
-            fsm.receive_input('principal', params["principal"])
+        price_result = extract_price(text)
+        if price_result is not None:
+            span = price_result["span"]
+            if not is_overlapping(span, used_spans):
+                used_spans.append(span)            
+                params["price"] = price_result["value"]
+                fsm.receive_input('price', price_result["value"])
 
-        # --- Interest Rate (% or decimal) ---
-        match = re.search(r"(\d+(?:\.\d+)?)\s*%", text)  # percentage
-        if match:
-            params["interest_rate"] = float(match.group(1)) / 100
-            fsm.receive_input('interest_rate', params["interest_rate"])
-        else:
-            match = re.search(r"interest rate (?:of )?(\d+\.\d+)", text, re.IGNORECASE)  # decimal
-            if match:
-                rate = float(match.group(1))
-                # Treat < 1 as already decimal (0.04), otherwise convert
-                params["interest_rate"] = rate if rate < 1 else rate / 100
-                fsm.receive_input('interest_rate', params["interest_rate"])
+        locations_result = extract_locations(text)
+        if locations_result is not None:
+            # Flatten the dictionary to get all locations
+            all_locations = []
+            for loc_type, loc_list in locations_result.items():
+                for loc in loc_list:
+                    all_locations.append(loc)
+            # Sort by span length to avoid overlapping
+            all_locations.sort(key=lambda x: x["span"][1] - x["span"][0])
+            # Check for overlapping spans
+            for loc in all_locations:
+                span = loc["span"]
+                if not is_overlapping(span, used_spans):
+                    used_spans.append(span)
+                    params["location"] = loc["name"]
+                    fsm.receive_input('location', loc["name"])
+                    break
 
-        # --- Mortgage Term (normalized to years) ---
-        match = re.search(r"(\d+(?:\.\d+)?)\s*(year|month|week|day)s?", text, re.IGNORECASE)
-        if match:
-            length = float(match.group(1))
-            unit = match.group(2).lower()
+        term_years_result = extract_term_years(text)
+        if term_years_result is not None:
+            span = term_years_result["span"]
+            if not is_overlapping(span, used_spans):
+                used_spans.append(span)            
+                params["term_years"] = term_years_result["value"]
+                fsm.receive_input('term_years', term_years_result["value"])
 
-            # Normalize to years
-            conversion_factors = {
-                "year": 1,
-                "month": 1 / 12,
-                "week": 1 / 52,
-                "day": 1 / 365
-            }
+        payment_frequency_result = extract_payment_frequency(text)
+        if payment_frequency_result is not None:
+            span = payment_frequency_result["span"]
+            if not is_overlapping(span, used_spans):
+                used_spans.append(span)            
+                params["payment_frequency"] = payment_frequency_result["value"]
+                fsm.receive_input('payment_frequency', payment_frequency_result["value"])
 
-            years = length * conversion_factors.get(unit, 0)
+        first_time_home_buyer_result = extract_first_time_home_buyer(text)
+        if first_time_home_buyer_result is not None:
+            span = first_time_home_buyer_result["span"]
+            if not is_overlapping(span, used_spans):
+                used_spans.append(span)            
+                params["first_time_home_buyer"] = first_time_home_buyer_result["value"]
+                fsm.receive_input('first_time_home_buyer', first_time_home_buyer_result["value"])
 
-            params["term_years"] = years
-            fsm.receive_input('term_years', params["term_years"])
+        down_payment_result = extract_down_payment(text)
+        if down_payment_result is not None and "price" in params:
+            span = down_payment_result["span"]
+            if not is_overlapping(span, used_spans):
+                used_spans.append(span)
+                min_down_payment = calculate_min_downpayment(params["price"])
+                if (down_payment_result["value"])["type"] == "absolute":
+                    down_payment = (down_payment_result["value"])["value"]
+                    if down_payment < min_down_payment:
+                        feedback_messages.append(f"Down payment of ${down_payment} is less than the minimum required ${min_down_payment}.")
+                    params["down_payment"] = down_payment
+                    fsm.receive_input('down_payment', down_payment)
+                elif (down_payment_result["value"])["type"] == "percent":
+                    down_payment = ((down_payment_result["value"])["value"] / 100) * params["price"]
+                    if down_payment < min_down_payment:
+                        feedback_messages.append(f"Down payment of ${down_payment} is less than the minimum required ${min_down_payment}.")
+                    params["down_payment"] = down_payment
+                    fsm.receive_input('down_payment', down_payment)
 
-        # --- Payment Frequency ---
-        match = re.search(r"(weekly|bi[-\s]?weekly|monthly|quarterly|annually|yearly)", text, re.IGNORECASE)
-        if match:
-            freq = match.group(1).lower().replace(" ", "").replace("-", "")
-            # normalize terms
-            frequency_map = {
-                "weekly": "weekly",
-                "biweekly": "bi-weekly",
-                "monthly": "monthly",
-                "quarterly": "quarterly",
-                "annually": "annually",
-                "yearly": "annually"
-            }
-            params["payment_frequency"] = frequency_map.get(freq, freq)
+        #interest_rate = extract_interest_rate(text)
+        #if interest_rate is not None:
+        #    params["interest_rate"] = interest_rate
+        #    fsm.receive_input('interest_rate', interest_rate)
 
     except Exception as e:
         print(f"[WARNING] Parameter extraction failed: {e}")
 
-    return params
+    return feedback_messages
 
-def calculate_monthly_payment(fsm: MortgageConversation) -> str:
-    """Calculates the monthly mortgage payment."""
+def calculate_mortgage_payment(fsm: MortgageConversation) -> str:
+    """Calculates the mortgage payment based on payment frequency."""
 
     try:
-        if fsm.state != "ready":
+        if fsm.state != "estimate":
             return "Not enough information to calculate the mortgage payment."
-        else:
-            n = fsm.collected_data["term_years"] * 12  # Total number of payments
-            r = fsm.collected_data["interest_rate"] / 12  # Monthly interest rate
 
-            if r == 0:
-                return fsm.collected_data["principal"] / n
-            payment = fsm.collected_data["principal"] * (r * (1 + r)**n) / ((1 + r)**n - 1)
-            return f"The estimated monthly payment is: ${payment:.2f}"
+        price = fsm.collected_data["price"]
+        insured = fsm.collected_data.get("insured", True)
+        frequency = fsm.collected_data.get("payment_frequency", "monthly")
+        down_payment = fsm.collected_data.get('down_payment', 0)
+
+        principal = price - down_payment
+
+        insurance = calculate_cmhc_insurance(price, down_payment)
+        
+        if fsm.collected_data['first_time_home_buyer']:
+            term_years = 30
+        else:
+            term_years = fsm.collected_data.get('term_years', 25)
+
+        interest_rate = get_interest_rate(term_years, insured)
+        annual_rate = interest_rate
+        r_annual = annual_rate
+
+        # Frequency settings
+        frequency_map = {
+            "monthly": 12,
+            "bi-weekly": 26,
+            "accelerated bi-weekly": 26,
+            "weekly": 52,
+            "accelerated weekly": 52,
+            "semi-monthly": 24,
+            "bi-monthly": 6,
+            "quarterly": 4,
+            "annually": 1
+        }
+
+        freq = frequency_map.get(frequency.lower(), 12)
+        r = r_annual / freq  # interest per period
+        n = term_years * freq  # number of payments
+
+        if r == 0:
+            payment = price / n
+        else:
+            payment = price * (r * (1 + r) ** n) / ((1 + r) ** n - 1)
+
+        return f"The estimated {frequency} payment is: ${payment:.2f}"
+
     except Exception as e:
         return f"Calculation error: {e}"
 
-system_context_general = (
-    "You are a helpful but very concise and not verbose assistant whose task is to help users located in Ontario, Canada "
-    "to estimate their payments on a mortgage given a certain "
-    "principal loan amount and interest rate, or other special mortgage scenarios like balloon payments. "
-    "Answers should be short and no longer than 250 characters. "
-    "The following values needed are still needed for the calculation: "
+system_context = (
+    "You are a helpful professional assistant to real estate agent Susan Varty. "
+    "Your purpose is to help potential clients located in Ontario, Canada "
+    "to estimate their monthly expenses and closing costs for a mortgage on a property of interest anywhere in the world if they are able to provide some basic information to you. "
+    "You will ask them for the information you need to calculate their mortgage, which at a minimum is just the price of the property they are interested in. "
+    "Answers should be short and no longer than 200 tokens. "
 )
 
-system_context_principal = (
-    "principal loan amount "
-)
+context_need_price = "Assume that user still has to provide the price of the property they are interested in. "
 
-system_context_interest_rate = (
-    "interest rate "
-)
+context_need_location = "Assume that user still has to provide the location of the property (nearest city or town). "
 
-system_context_payment_frequency = (
-    "interest payment frequency "
-)
+system_context_result = "Notify the user concisely of the result of the calculations. "
 
-system_context_term_years = (
-    "length of the term of the mortgage "
-)
 
-system_context_result = (
-    "Notify the user concisely of the result of the calculations: "
-)
-
-prompt_parts = {
-    "general": system_context_general,
-    "principal": system_context_principal,
-    "interest_rate": system_context_interest_rate,
-    "term_years": system_context_term_years,
-    "payment_frequency": system_context_payment_frequency,
-    "result": system_context_result,
-}
-
-def generate_response(prompt: str, pipe, fsm) -> str:
+def generate_response(user_input: str, pipe, fsm) -> str:
     """Generates the initial text response from the LLM."""
-    global system_context
-    
-    extract_mortgage_parameters(prompt, fsm)
+    global system_context, context_need_price, context_need_location, system_context_result
+
+    # Step 1: Start with base system prompt
+    system_prompt = system_context or ""
+    additional_instructions = []
+
+    # Step 2: Dynamically add more instructions as needed
+
+    feedback_messages = extract_mortgage_parameters(user_input, fsm)
 
     # select the message to add to general context based on what information it still needs in order to calculate mortgage
-    print(f"[DEBUG]Still needed: {fsm.missing_fields()}")
-    missing = fsm.missing_fields()
-    if fsm.state == "ready":
+    #print(f"[DEBUG]Still needed: {fsm.missing_fields()}")
+    #missing = fsm.missing_fields()
+    if fsm.state == "estimate":
         # do calculation, and add result to system context to report result to user
-        calculation_result = calculate_monthly_payment(fsm)
-        system_context = " ".join([prompt_parts["general"], prompt_parts["result"], " ".join(calculation_result)])
-    else:
-        prompts_for_missing = [prompt_parts[k] for k in missing if k in prompt_parts]
-        system_context = " ".join([prompt_parts["general"], " ".join(prompts_for_missing)])
+        calculation_result = calculate_mortgage_payment(fsm)
+        additional_instructions.append(system_context_result)
+        additional_instructions.append(calculation_result)
+        if feedback_messages:
+            additional_instructions.extend(msg.strip() for msg in feedback_messages)
+    elif fsm.state == "collecting_location":
+        #prompts_for_missing = [prompt_parts[k] for k in missing if k in prompt_parts]
+        additional_instructions.append(context_need_location)
+        if feedback_messages:
+            additional_instructions.extend(msg.strip() for msg in feedback_messages)
+    elif fsm.state == "collecting_price":
+        #prompts_for_missing = [prompt_parts[k] for k in missing if k in prompt_parts]
+        additional_instructions.append(context_need_price)
+        if feedback_messages:
+            additional_instructions.extend(msg.strip() for msg in feedback_messages)
+    elif fsm.state == "book_meeting":
+        print(f"[DEBUG] Book Meeting hook triggered")
+    elif fsm.state == "show_listings":
+        print(f"[DEBUG] Show Listings hook triggered")
+    elif fsm.state == "error":
+        if feedback_messages:
+            additional_instructions.extend(msg.strip() for msg in feedback_messages)
+    
+    # Step 3: Merge them into system_prompt
+    if additional_instructions:
+        system_prompt += " " + " ".join(additional_instructions)
 
-    full_prompt = f"{system_context}\n\nUser: {prompt}\nAssistant:"
+    # Step 4: Wrap in [INST] block
+    prompt = f"[INST] {system_prompt.strip()} [/INST]\nUser: {user_input.strip()}\nAssistant:"
+
+    print(f"[DEBUG] Calling model pipeline with:\n{prompt}")
+
 
     try:
-        outputs = pipe(
-            full_prompt,
-            max_new_tokens=256,
-            do_sample=True
+        output = pipe(prompt, stop_sequences=["User:", "Assistant:"], max_new_tokens=150, temperature=0.7, top_p=0.9)[0]["generated_text"]
+        #response = pipe(
+        #    prompt,
+        #    max_new_tokens=150,
+        #    do_sample=True
             #eos_token_id=tokenizer.eos_token_id,
             #pad_token_id=tokenizer.eos_token_id,
             #stop_sequence=["\n\n", "</s>", "<|endoftext|>"]
-        )
-        if not outputs or "generated_text" not in outputs[0]:
-            raise ValueError("Model output missing 'generated_text'")
+        #)
+        #if not output or "generated_text" not in output[0]:
+        #    raise ValueError("Model output missing 'generated_text'")
 
-        ai_response = outputs[0]["generated_text"]
-        # Find split point and extract just the assistant's reply
-        split_marker = f"User: {prompt}\nAssistant:"
-        if split_marker in ai_response:
-            ai_response = ai_response.split(split_marker)[-1].strip()
-        else:
-            ai_response = ai_response.strip()
-        # Only keep the assistant's part before the AI hallucinates another user turn
-        stop_marker = "\nUser:"
-        if stop_marker in ai_response:
-            ai_response = ai_response.split(stop_marker)[0].strip()
-        else:
-            ai_response = ai_response.strip()            
-        print(f"[DEBUG] Cleaned AI response: {repr(ai_response)}") 
-        return ai_response
+        response = output.split("Assistant:", 1)[-1].strip()
+        
+        raw_output = response[0]["generated_text"]
+        model_output = raw_output[len(prompt):].strip()
+        cleaned_output = model_output.replace("<|endoftext|>", "").strip()
+
+        print(f"[DEBUG] Cleaned AI response: '{cleaned_output}'")
+        print(f"[DEBUG] Raw model output: {raw_output}")
+
+        return cleaned_output
     except Exception as e:
         traceback.print_exc()
         print(f"[ERROR] Error during generation: {e}")  # Log the detailed error
@@ -443,7 +718,9 @@ async def chat_endpoint(request: Request):
     req_json = await request.json()
     session_id = req_json.get("session_id")
     if not session_id:
-        session_id = str(uuid4())
+        raise HTTPException(status_code=400, detail="Missing session_id")
+    #if not session_id:
+    #    session_id = str(uuid4())
     with conversation_lock:
         session = conversation_state.setdefault(session_id, {
             "history": [],
