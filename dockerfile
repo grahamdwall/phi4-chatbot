@@ -2,7 +2,7 @@
 
 FROM python:3.11-slim
 
-LABEL org.opencontainers.image.source="https://github.com/grahamdwall/phi2-finetune"
+LABEL org.opencontainers.image.source="https://github.com/grahamdwall/phi4-chatbot"
 
 ENV PYTHONUNBUFFERED=1d
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -34,6 +34,9 @@ COPY requirements.txt .
 
 # Install torch with CUDA 12.1 from the custom PyTorch index
 RUN pip install --no-cache-dir torch==2.1.2+cu121 --index-url https://download.pytorch.org/whl/cu121
+
+# Fix for flash_attn and similar packages
+RUN pip install --no-cache-dir packaging==23.2 setuptools==69.5.1 wheel==0.42.0
 
 # Then install the rest of the requirements from your requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt

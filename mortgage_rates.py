@@ -67,7 +67,7 @@ def calculate_min_downpayment(home_price):
     """
     if home_price <= 500000:
         return home_price * 0.05
-    elif home_price <= 1499999:
+    elif home_price < 1500000:
         return 500000 * 0.05 + (home_price - 500000) * 0.10
     else:
         return home_price * 0.20
@@ -83,17 +83,23 @@ def calculate_cmhc_insurance(purchase_price: float, down_payment: float) -> floa
     min_down_payment = calculate_min_downpayment(purchase_price)
     # Check if the down payment is less than the minimum required
     if down_payment < min_down_payment:
-        raise ValueError(f"Down payment must be at least {min_down_payment:.2f} for a purchase price of {purchase_price:.2f}")
+        down_payment = min_down_payment # clamp down payment to minimum required to ensure calculation can proceed
+        #raise ValueError(f"Down payment must be at least {min_down_payment:.2f} for a purchase price of {purchase_price:.2f}")
 
     # Check if the down payment is greater than the purchase price
     if down_payment > purchase_price:
-        raise ValueError("Down payment cannot exceed the purchase price")
+        down_payment = purchase_price # clamp down payment to purchase price to ensure calculation can proceed
+        #raise ValueError("Down payment cannot exceed the purchase price")
+
     # Check if the purchase price is less than or equal to zero
     if purchase_price <= 0:
-        raise ValueError("Purchase price must be greater than zero")
+        purchase_price = 1 # clamp purchase price to 1 to ensure calculation can proceed
+        #raise ValueError("Purchase price must be greater than zero")
+    
     # Check if the down payment is less than or equal to zero
     if down_payment <= 0:
-        raise ValueError("Down payment must be greater than zero")
+        down_payment = 1 # clamp down payment to 1 to ensure calculation can proceed
+        #raise ValueError("Down payment must be greater than zero")
     
     # CMHC insurance is not available for homes priced at $1,500,000 or more
     if purchase_price >= 1_500_000:
@@ -232,23 +238,26 @@ def fetch_latest_mortgage_rates():
         }
     return interest_rate_data
 
-def get_interest_rate(term_years: float, insured: bool):
+def get_interest_rate_percent(term_years: float, insured: bool) -> float:
     """
     Returns the interest rate for a given term length and insurance status.
     """
+    print("get_interest_rates()")
+    print("term_years:", term_years)
+    print("insured:", insured)
     rates = fetch_latest_mortgage_rates()
     if not rates:
         print("No rate data available.")
         return None
 
-    #print(rates)
+    print(rates)
 
     # Filter rates based on term and insurance status
     matching_rates = []
     for key in rates:
         rate = rates[key]
         #print(rate)
-        if rate['insured'] == insured and rate['term_from'] is not None and rate['term_to'] is not None and int(rate['term_from']) <= term_years < int(rate['term_to']):
+        if rate['insured'] == insured and rate['term_from'] is not None and rate['term_to'] is not None and int(rate['term_from']) < term_years <= int(rate['term_to']):
             matching_rates.append(rate)
             break
 
@@ -264,7 +273,7 @@ def get_interest_rate(term_years: float, insured: bool):
 if __name__ == "__main__":
     term_length = 5  # in years
     is_insured = True
-    rate = get_interest_rate(term_length, is_insured)
+    rate = get_interest_rate_percent(term_length, is_insured)
     if rate is not None:
         print(f"The interest rate for a {term_length}-year {'insured' if is_insured else 'uninsured'} mortgage is {rate}%.")
     else:

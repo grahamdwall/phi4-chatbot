@@ -2,11 +2,11 @@ fastapi
 uvicorn
 gunicorn
 numpy==1.26.4
-transformers>=4.38
-accelerate==0.29.2
+#transformers>=4.38
+#accelerate==0.29.2
 pydantic>=2.0,<3.0
 datasets
-peft==0.10.0
+#peft==0.10.0
 dotenv
 argparse
 python-multipart>=0.0.5
@@ -18,3 +18,15 @@ locationtagger
 newspaper3k
 lxml[html_clean]
 nltk
+
+# recommended for Phi-4
+#flash_attn==2.7.4.post1
+#torch==2.6.0 using torch family of packages on commandline
+transformers==4.48.2
+accelerate==1.3.0
+soundfile==0.13.1
+pillow==11.1.0
+scipy==1.15.2
+#torchvision==0.21.0 using torch family of packages on commandline
+backoff==2.2.1
+peft==0.13.2
